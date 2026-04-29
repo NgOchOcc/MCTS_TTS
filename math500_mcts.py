@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import sys
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -69,6 +70,48 @@ SYSTEM_PROMPT = (
 # Qwen2.5-Math-PRM-7B uses <extra_0> as step-boundary marker (token id 151651)
 PRM_STEP_TAG     = "<extra_0>"
 PRM_STEP_TAG_ID  = 151651   # verified against tokenizer vocab
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token counter
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class TokenStats:
+    """Accumulates token usage for one problem across all MCTS steps."""
+    llm_prompt_tokens:     int = 0
+    llm_generated_tokens:  int = 0
+    prm_input_tokens:      int = 0
+    llm_calls:             int = 0
+    prm_calls:             int = 0
+
+    def add_llm(self, prompt_toks: int, gen_toks: int) -> None:
+        self.llm_prompt_tokens    += prompt_toks
+        self.llm_generated_tokens += gen_toks
+        self.llm_calls            += 1
+
+    def add_prm(self, input_toks: int) -> None:
+        self.prm_input_tokens += input_toks
+        self.prm_calls        += 1
+
+    @property
+    def total_llm_tokens(self) -> int:
+        return self.llm_prompt_tokens + self.llm_generated_tokens
+
+    @property
+    def total_tokens(self) -> int:
+        return self.total_llm_tokens + self.prm_input_tokens
+
+    def to_dict(self) -> dict:
+        return {
+            "llm_prompt_tokens":    self.llm_prompt_tokens,
+            "llm_generated_tokens": self.llm_generated_tokens,
+            "prm_input_tokens":     self.prm_input_tokens,
+            "total_llm_tokens":     self.total_llm_tokens,
+            "total_tokens":         self.total_tokens,
+            "llm_calls":            self.llm_calls,
+            "prm_calls":            self.prm_calls,
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,7 +162,7 @@ class LLMGenerator:
             messages, tokenize=False, add_generation_prompt=True
         )
 
-    def _sample(self, prompt: str, temperature: float) -> str:
+    def _sample(self, prompt: str, temperature: float) -> tuple[str, int, int]:
         from vllm import SamplingParams  # deferred import
 
         params = SamplingParams(
@@ -128,7 +171,11 @@ class LLMGenerator:
             max_tokens=self.max_tokens,
         )
         outputs = self.llm.generate([prompt], params)
-        return outputs[0].outputs[0].text.strip()
+        out = outputs[0]
+        text        = out.outputs[0].text.strip()
+        prompt_toks = len(out.prompt_token_ids)
+        gen_toks    = len(out.outputs[0].token_ids)
+        return text, prompt_toks, gen_toks
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -137,9 +184,13 @@ class LLMGenerator:
         problem: str,
         parent_solution: Optional[str] = None,  # noqa: ARG002  (ignored)
         temperature: float = 0.7,
+        token_stats: Optional[TokenStats] = None,
     ) -> str:
         prompt = self._build_prompt(problem)
-        return self._sample(prompt, temperature)
+        text, prompt_toks, gen_toks = self._sample(prompt, temperature)
+        if token_stats is not None:
+            token_stats.add_llm(prompt_toks, gen_toks)
+        return text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -222,7 +273,12 @@ class QwenPRMScorer:
     # ── scoring ───────────────────────────────────────────────────────────────
 
     @torch.inference_mode()
-    def score(self, problem: str, solution: str) -> float:
+    def score(
+        self,
+        problem: str,
+        solution: str,
+        token_stats: Optional[TokenStats] = None,
+    ) -> float:
         """
         Return the PRM score of the *last* step ∈ [0, 1].
         Returns 0.0 if the model cannot find any step markers.
@@ -231,6 +287,9 @@ class QwenPRMScorer:
         input_ids = self.tokenizer.apply_chat_template(
             conversation, return_tensors="pt"
         ).to(self.device)
+
+        if token_stats is not None:
+            token_stats.add_prm(input_ids.shape[1])
 
         # Mark positions of <extra_0> tokens
         step_mask = input_ids == PRM_STEP_TAG_ID   # shape: [1, seq_len]
@@ -267,19 +326,22 @@ def make_generate_fn(
     prm: QwenPRMScorer,
     problem: str,
     temperature: float,
+    token_stats: TokenStats,
 ):
     """
     Returns a generate_fn compatible with treequest's StandardMCTS.
 
     Signature: (parent_state: str | None) -> (solution: str, score: float)
+    token_stats is updated in-place for every call.
     """
     def generate_fn(parent_state: Optional[str]) -> tuple[str, float]:
         solution = generator.generate(
             problem,
             parent_solution=parent_state,
             temperature=temperature,
+            token_stats=token_stats,
         )
-        score = prm.score(problem, solution)
+        score = prm.score(problem, solution, token_stats=token_stats)
         return solution, score
 
     return generate_fn
@@ -369,10 +431,15 @@ def solve_one(
     )
     state = algo.init_tree()
 
+    # Shared token counter for this problem (all generate_fns write to it)
+    token_stats = TokenStats()
+
     generate_fns = {
         # Two actions with different temperatures → diversity in the MCTS tree
-        "gen_a": make_generate_fn(generator, prm, problem, temperature=0.7),
-        "gen_b": make_generate_fn(generator, prm, problem, temperature=1.0),
+        "gen_a": make_generate_fn(generator, prm, problem, temperature=0.7,
+                                  token_stats=token_stats),
+        "gen_b": make_generate_fn(generator, prm, problem, temperature=1.0,
+                                  token_stats=token_stats),
     }
 
     for _ in range(mcts_steps):
@@ -382,13 +449,14 @@ def solve_one(
     pairs = algo.get_state_score_pairs(state)
     if not pairs:
         return {
-            "problem":      problem,
-            "ground_truth": ground_truth,
-            "best_solution": None,
-            "best_score":    0.0,
+            "problem":          problem,
+            "ground_truth":     ground_truth,
+            "best_solution":    None,
+            "best_score":       0.0,
             "predicted_answer": None,
-            "is_correct":    False,
-            "all_solutions": [],
+            "is_correct":       False,
+            "all_solutions":    [],
+            "token_stats":      token_stats.to_dict(),
         }
 
     best_solution, best_score = max(pairs, key=lambda x: x[1])
@@ -409,6 +477,7 @@ def solve_one(
             {"solution": sol, "score": sc}
             for sol, sc in top3
         ],
+        "token_stats": token_stats.to_dict(),
     }
 
 
@@ -496,27 +565,40 @@ def main():
                 "best_solution": None, "best_score": 0.0,
                 "predicted_answer": None, "is_correct": False,
                 "top3": [], "error": str(e),
+                "token_stats": TokenStats().to_dict(),
             }
 
         result["unique_id"] = unique_id
         results.append(result)
         n_correct += int(result["is_correct"])
 
+        ts       = result["token_stats"]
         accuracy = n_correct / len(results) * 100
         logger.info(
             f"  predicted={result['predicted_answer']}  "
             f"gt={ground_truth}  "
             f"correct={result['is_correct']}  "
-            f"running_acc={accuracy:.1f}%"
+            f"running_acc={accuracy:.1f}%  "
+            f"tokens(llm={ts['total_llm_tokens']} prm={ts['prm_input_tokens']} "
+            f"total={ts['total_tokens']})"
         )
 
+    # ── token aggregation ──────────────────────────────────────────────────────
+    keys = ["llm_prompt_tokens", "llm_generated_tokens", "prm_input_tokens",
+            "total_llm_tokens", "total_tokens", "llm_calls", "prm_calls"]
+    n = len(results)
+    token_totals  = {k: sum(r["token_stats"].get(k, 0) for r in results) for k in keys}
+    token_avg     = {f"avg_{k}": round(token_totals[k] / n, 1) for k in keys} if n else {}
+
     # ── summary ───────────────────────────────────────────────────────────────
-    accuracy = n_correct / len(results) * 100 if results else 0.0
+    accuracy = n_correct / n * 100 if n else 0.0
     summary = {
         "timestamp":     datetime.now().isoformat(),
-        "num_problems":  len(results),
+        "num_problems":  n,
         "num_correct":   n_correct,
         "accuracy":      f"{accuracy:.2f}%",
+        "token_totals":  token_totals,
+        "token_averages": token_avg,
         "config": {
             "llm_path":           args.llm_path,
             "prm_path":           args.prm_path,
@@ -532,8 +614,17 @@ def main():
         json.dump(output_data, f, indent=2, ensure_ascii=False)
 
     logger.info("=" * 60)
-    logger.info(f"Accuracy : {accuracy:.2f}%  ({n_correct}/{len(results)})")
-    logger.info(f"Saved to : {out_path}")
+    logger.info(f"Accuracy        : {accuracy:.2f}%  ({n_correct}/{n})")
+    logger.info(f"Total tokens    : {token_totals['total_tokens']:,}")
+    logger.info(f"  └ LLM prompt  : {token_totals['llm_prompt_tokens']:,}")
+    logger.info(f"  └ LLM gen     : {token_totals['llm_generated_tokens']:,}")
+    logger.info(f"  └ PRM input   : {token_totals['prm_input_tokens']:,}")
+    logger.info(f"Avg per problem : {token_avg.get('avg_total_tokens', 0):,.1f} tokens")
+    logger.info(f"  └ avg LLM     : {token_avg.get('avg_total_llm_tokens', 0):,.1f}")
+    logger.info(f"  └ avg PRM     : {token_avg.get('avg_prm_input_tokens', 0):,.1f}")
+    logger.info(f"  └ avg calls   : {token_avg.get('avg_llm_calls', 0):.1f} LLM / "
+                f"{token_avg.get('avg_prm_calls', 0):.1f} PRM")
+    logger.info(f"Saved to        : {out_path}")
     logger.info("=" * 60)
 
 
